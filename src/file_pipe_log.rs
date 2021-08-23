@@ -186,24 +186,30 @@ impl LogManager {
                 } else {
                     raw_file_reader
                 };
-                if let Err(e) = reader.open(file_reader, file_size) {
-                    if !tolerate_failure {
-                        return Err(Error::Corruption(format!("Unable to open log file: {}", e)));
+                match reader.open(file_reader, file_size) {
+                    Err(e) => {
+                        if !tolerate_failure {
+                            return Err(Error::Corruption(format!(
+                                "Unable to open log file: {}",
+                                e
+                            )));
+                        }
                     }
-                } else {
-                    loop {
-                        match reader.next() {
-                            Ok(Some(mut item_batch)) => {
-                                item_batch.set_position(queue, file_id, None);
-                                replay(queue, file_id, item_batch);
+                    Ok(iter) => {
+                        for r in iter {
+                            match r {
+                                Ok(mut item_batch) => {
+                                    item_batch.set_position(queue, file_id, None);
+                                    replay(queue, file_id, item_batch);
+                                }
+                                Err(e) if tolerate_failure => {
+                                    return Err(Error::Corruption(format!(
+                                        "Raft log content is corrupted: {}",
+                                        e
+                                    )))
+                                }
+                                _ => break,
                             }
-                            Err(e) if tolerate_failure => {
-                                return Err(Error::Corruption(format!(
-                                    "Raft log content is corrupted: {}",
-                                    e
-                                )))
-                            }
-                            _ => break,
                         }
                     }
                 }

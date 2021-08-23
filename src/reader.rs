@@ -5,8 +5,22 @@ use crate::log_batch::{LogBatch, LogItemBatch, LOG_BATCH_HEADER_LEN};
 use crate::log_file::{LogFileHeader, LOG_FILE_MAX_HEADER_LEN};
 use crate::{Error, Result};
 
+type File = Box<dyn Readable>;
+
+pub struct LogItemBatchIterator<'a> {
+    reader: &'a mut LogItemBatchFileReader,
+}
+
+impl<'a> Iterator for LogItemBatchIterator<'a> {
+    type Item = Result<LogItemBatch>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.reader.next().transpose()
+    }
+}
+
 pub struct LogItemBatchFileReader {
-    file: Option<Box<dyn Readable>>,
+    file: Option<File>,
     size: usize,
 
     buffer: Vec<u8>,
@@ -30,7 +44,7 @@ impl LogItemBatchFileReader {
         }
     }
 
-    pub fn open(&mut self, file: Box<dyn Readable>, size: usize) -> Result<()> {
+    pub fn open(&mut self, file: File, size: usize) -> Result<LogItemBatchIterator> {
         self.file = Some(file);
         self.size = size;
         self.buffer.clear();
@@ -40,14 +54,14 @@ impl LogItemBatchFileReader {
         let mut header = self.peek(0, peek_size, LOG_BATCH_HEADER_LEN)?;
         LogFileHeader::decode(&mut header)?;
         self.valid_offset = peek_size - header.len();
-        Ok(())
+        Ok(LogItemBatchIterator { reader: self })
     }
 
     pub fn valid_offset(&self) -> usize {
         self.valid_offset
     }
 
-    pub fn next(&mut self) -> Result<Option<LogItemBatch>> {
+    fn next(&mut self) -> Result<Option<LogItemBatch>> {
         if self.valid_offset < LOG_BATCH_HEADER_LEN {
             return Err(Error::Corruption(
                 "attempt to read file with broken header".to_owned(),
