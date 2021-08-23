@@ -4,12 +4,13 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crossbeam::channel::{unbounded, Receiver, Sender};
+use log::debug;
 use parking_lot::Mutex;
 
 use crate::file_system::Readable;
 use crate::log_batch::{LogBatch, LogItemBatch, LOG_BATCH_HEADER_LEN};
 use crate::log_file::{LogFileHeader, LOG_FILE_MAX_HEADER_LEN};
-use crate::{Error, ReadableSize, Result};
+use crate::{Error, FileId, Result};
 
 type File = Box<dyn Readable>;
 
@@ -139,13 +140,13 @@ impl LogItemBatchFileReader {
     }
 }
 
-type LogItemBatchReceiver = Receiver<Option<Result<LogItemBatch>>>;
+type LogItemBatchReceiver = Receiver<Option<(FileId, Result<LogItemBatch>)>>;
 
 pub struct LogItemBatchConcurrentFilesReader {
     mem_limits: usize,
     read_block_size: usize,
 
-    files: Arc<Mutex<VecDeque<(File, usize)>>>,
+    files: Arc<Mutex<VecDeque<(FileId, File, usize)>>>,
     sender: Sender<Option<LogItemBatchReceiver>>,
     receiver: Receiver<Option<LogItemBatchReceiver>>,
     current: Option<LogItemBatchReceiver>,
@@ -153,15 +154,15 @@ pub struct LogItemBatchConcurrentFilesReader {
 
 impl LogItemBatchConcurrentFilesReader {
     pub fn open(
-        files: VecDeque<(File, usize)>,
+        files: VecDeque<(FileId, File, usize)>,
         concurrency: usize,
-        mem_limits: ReadableSize,
-        read_block_size: ReadableSize,
+        mem_limits: usize,
+        read_block_size: usize,
     ) -> Result<Self> {
         let (tx, rs) = unbounded();
         let mut reader = Self {
-            mem_limits: mem_limits.0 as usize,
-            read_block_size: read_block_size.0 as usize,
+            mem_limits,
+            read_block_size,
 
             files: Arc::new(Mutex::new(files)),
             sender: tx,
@@ -174,7 +175,7 @@ impl LogItemBatchConcurrentFilesReader {
         Ok(reader)
     }
 
-    pub fn next(&mut self) -> Option<Result<LogItemBatch>> {
+    pub fn next(&mut self) -> Option<(FileId, Result<LogItemBatch>)> {
         if let Some(ref mut current) = self.current {
             match current.recv().unwrap() {
                 Some(r) => return Some(r),
@@ -201,19 +202,23 @@ impl LogItemBatchConcurrentFilesReader {
                 let (tx, rx) = unbounded();
                 sender.send(Some(rx)).unwrap();
                 drop(guard);
-                let iter = match reader.open(file.0, file.1) {
+                debug!("read file: {:?}", file.0);
+                let iter = match reader.open(file.1, file.2) {
                     Ok(iter) => iter,
                     Err(e) => {
-                        tx.send(Some(Err(e))).unwrap();
+                        tx.send(Some((file.0, Err(e)))).unwrap();
                         break;
                     }
                 };
                 for r in iter {
-                    tx.send(Some(r)).unwrap();
+                    tx.send(Some((file.0, r))).unwrap();
                 }
                 tx.send(None).unwrap();
             } else {
-                sender.send(None).unwrap();
+                if let Err(_) = sender.send(None) {
+                    debug!("Tail None.");
+                }
+                break;
             }
         });
     }

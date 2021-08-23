@@ -15,10 +15,10 @@ use crate::event_listener::EventListener;
 use crate::file_system::{FileSystem, Readable, Writable};
 use crate::log_batch::{LogBatch, LogItemBatch};
 use crate::log_file::{LogFd, LogFile, LogFileHeader, LOG_FILE_MIN_HEADER_LEN};
-use crate::metrics::*;
 use crate::pipe_log::{FileId, LogQueue, PipeLog};
-use crate::reader::LogItemBatchFileReader;
+use crate::reader::{LogItemBatchConcurrentFilesReader, LogItemBatchFileReader};
 use crate::util::InstantExt;
+use crate::{metrics::*, ReadableSize};
 use crate::{Error, Result};
 
 const LOG_SUFFIX: &str = ".raftlog";
@@ -164,8 +164,10 @@ impl LogManager {
     where
         F: Fn(LogQueue, FileId, LogItemBatch),
     {
-        let mut reader = LogItemBatchFileReader::new(cfg.recovery_read_block_size.0 as usize);
         let mut all_files = VecDeque::with_capacity(DEFAULT_FILES_COUNT);
+        let mut recover_files = VecDeque::with_capacity(all_files.len());
+        let mut active_file_size = 0;
+
         if max_file_id.valid() {
             assert!(min_file_id <= max_file_id);
             let mut file_id = min_file_id;
@@ -176,43 +178,54 @@ impl LogManager {
                 for listener in &listeners {
                     listener.post_new_log_file(queue, file_id);
                 }
-                // Recover log items.
-                let file_size = fd.file_size()?;
-                let tolerate_failure = file_id == max_file_id
-                    && cfg.recovery_mode == RecoveryMode::TolerateCorruptedTailRecords;
+
+                // TODO(MrCroxx): Refine this.
+                active_file_size = fd.file_size()?;
                 let raw_file_reader = Box::new(LogFile::new(fd));
                 let file_reader = if let Some(ref fs) = file_system {
                     fs.open_file_reader(&path, raw_file_reader as Box<dyn Readable>)?
                 } else {
                     raw_file_reader
                 };
-                match reader.open(file_reader, file_size) {
-                    Err(e) => {
-                        if !tolerate_failure {
-                            return Err(Error::Corruption(format!(
-                                "Unable to open log file: {}",
-                                e
-                            )));
-                        }
-                    }
-                    Ok(iter) => {
-                        for r in iter {
-                            match r {
-                                Ok(mut item_batch) => {
-                                    item_batch.set_position(queue, file_id, None);
-                                    replay(queue, file_id, item_batch);
-                                }
-                                Err(e) if tolerate_failure => {
-                                    return Err(Error::Corruption(format!(
-                                        "Raft log content is corrupted: {}",
-                                        e
-                                    )))
-                                }
-                                _ => break,
-                            }
-                        }
-                    }
-                }
+                recover_files.push_back((file_id, file_reader, active_file_size));
+                // Recover log items.
+                // let file_size = fd.file_size()?;
+                // active_file_size = file_size;
+                // let tolerate_failure = file_id == max_file_id
+                //     && cfg.recovery_mode == RecoveryMode::TolerateCorruptedTailRecords;
+                // let raw_file_reader = Box::new(LogFile::new(fd));
+                // let file_reader = if let Some(ref fs) = file_system {
+                //     fs.open_file_reader(&path, raw_file_reader as Box<dyn Readable>)?
+                // } else {
+                //     raw_file_reader
+                // };
+                // match reader.open(file_reader, file_size) {
+                //     Err(e) => {
+                //         if !tolerate_failure {
+                //             return Err(Error::Corruption(format!(
+                //                 "Unable to open log file: {}",
+                //                 e
+                //             )));
+                //         }
+                //     }
+                //     Ok(iter) => {
+                //         for r in iter {
+                //             match r {
+                //                 Ok(mut item_batch) => {
+                //                     item_batch.set_position(queue, file_id, None);
+                //                     replay(queue, file_id, item_batch);
+                //                 }
+                //                 Err(e) if tolerate_failure => {
+                //                     return Err(Error::Corruption(format!(
+                //                         "Raft log content is corrupted: {}",
+                //                         e
+                //                     )))
+                //                 }
+                //                 _ => break,
+                //             }
+                //         }
+                //     }
+                // }
                 file_id = file_id.forward(1);
             }
         } else {
@@ -228,7 +241,36 @@ impl LogManager {
                 listener.post_new_log_file(queue, min_file_id);
             }
         }
-        let active_file_size = reader.valid_offset();
+
+        let mut reader = LogItemBatchConcurrentFilesReader::open(
+            recover_files,
+            10,
+            ReadableSize::gb(1).0 as usize,
+            cfg.recovery_read_block_size.0 as usize,
+        )
+        .unwrap();
+        loop {
+            match reader.next() {
+                Some((file_id, r)) => match r {
+                    Ok(mut item_batch) => {
+                        item_batch.set_position(queue, file_id, None);
+                        replay(queue, file_id, item_batch)
+                    }
+                    Err(e)
+                        if file_id == max_file_id
+                            && cfg.recovery_mode == RecoveryMode::TolerateCorruptedTailRecords =>
+                    {
+                        return Err(Error::Corruption(format!(
+                            "Raft log content is corrupted: {}",
+                            e
+                        )))
+                    }
+                    _ => break,
+                },
+                None => break,
+            }
+        }
+
         let active_fd = all_files.back().unwrap().clone();
         let raw_writer = Box::new(LogFile::new(active_fd.clone()));
         let active_file = ActiveFile::open(
