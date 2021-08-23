@@ -22,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 macro_rules! box_err {
     ($e:expr) => ({
         use std::error::Error;
-        let e: Box<dyn Error> = format!("[{}:{}]: {}", file!(), line!(),  $e).into();
+        let e: Box<dyn Error + Send + Sync> = format!("[{}:{}]: {}", file!(), line!(),  $e).into();
         e.into()
     });
     ($f:tt, $($arg:expr),+) => ({

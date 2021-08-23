@@ -1,17 +1,23 @@
 // Copyright 2021 TiKV Project Authors. Licensed under Apache-2.0.
 
+use std::collections::VecDeque;
+use std::sync::Arc;
+
+use crossbeam::channel::{unbounded, Receiver, Sender};
+use parking_lot::Mutex;
+
 use crate::file_system::Readable;
 use crate::log_batch::{LogBatch, LogItemBatch, LOG_BATCH_HEADER_LEN};
 use crate::log_file::{LogFileHeader, LOG_FILE_MAX_HEADER_LEN};
-use crate::{Error, Result};
+use crate::{Error, ReadableSize, Result};
 
 type File = Box<dyn Readable>;
 
-pub struct LogItemBatchIterator<'a> {
+pub struct FileLogItemBatchIterator<'a> {
     reader: &'a mut LogItemBatchFileReader,
 }
 
-impl<'a> Iterator for LogItemBatchIterator<'a> {
+impl<'a> Iterator for FileLogItemBatchIterator<'a> {
     type Item = Result<LogItemBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -44,7 +50,7 @@ impl LogItemBatchFileReader {
         }
     }
 
-    pub fn open(&mut self, file: File, size: usize) -> Result<LogItemBatchIterator> {
+    pub fn open(&mut self, file: File, size: usize) -> Result<FileLogItemBatchIterator> {
         self.file = Some(file);
         self.size = size;
         self.buffer.clear();
@@ -54,7 +60,7 @@ impl LogItemBatchFileReader {
         let mut header = self.peek(0, peek_size, LOG_BATCH_HEADER_LEN)?;
         LogFileHeader::decode(&mut header)?;
         self.valid_offset = peek_size - header.len();
-        Ok(LogItemBatchIterator { reader: self })
+        Ok(FileLogItemBatchIterator { reader: self })
     }
 
     pub fn valid_offset(&self) -> usize {
@@ -130,5 +136,80 @@ impl LogItemBatchFileReader {
             }
             Ok(&self.buffer[offset - self.buffer_offset..offset - self.buffer_offset + size])
         }
+    }
+}
+
+type LogItemBatchReceiver = Receiver<Option<Result<LogItemBatch>>>;
+
+pub struct LogItemBatchConcurrentFilesReader {
+    // concurrency: usize,
+    mem_limits: usize,
+    read_block_size: usize,
+
+    files: Arc<Mutex<VecDeque<(File, usize)>>>,
+    sender: Sender<Option<LogItemBatchReceiver>>,
+    receiver: Receiver<Option<LogItemBatchReceiver>>,
+    current: Option<LogItemBatchReceiver>,
+}
+
+impl LogItemBatchConcurrentFilesReader {
+    pub fn open(
+        files: VecDeque<(File, usize)>,
+        concurrency: usize,
+        mem_limits: ReadableSize,
+        read_block_size: ReadableSize,
+    ) -> Result<Self> {
+        let (tx, rs) = unbounded();
+        let mut reader = Self {
+            // concurrency,
+            mem_limits: mem_limits.0 as usize,
+            read_block_size: read_block_size.0 as usize,
+
+            files: Arc::new(Mutex::new(files)),
+            sender: tx,
+            receiver: rs,
+            current: None,
+        };
+        for _ in 0..concurrency {
+            reader.spawn()?;
+        }
+        Ok(reader)
+    }
+
+    pub fn next(&mut self) -> Result<Option<LogItemBatch>> {
+        if let Some(ref mut current) = self.current {
+            todo!()
+        } else {
+            todo!()
+        }
+    }
+
+    fn spawn(&mut self) -> Result<()> {
+        if let Some(file) = self.files.lock().pop_front() {
+            let mut reader = LogItemBatchFileReader::new(self.read_block_size);
+            let (tx, rx) = unbounded();
+            if let Err(e) = self.sender.send(Some(rx)) {
+                return Err(box_err!("broken channel: {:?}", e));
+            }
+            std::thread::spawn(move || match reader.open(file.0, file.1) {
+                Err(e) => tx.send(Some(Err(e))).unwrap(),
+                Ok(iter) => {
+                    for r in iter {
+                        match r {
+                            Err(e) => {
+                                tx.send(Some(Err(e))).unwrap();
+                                break;
+                            }
+                            Ok(batch) => tx.send(Some(Ok(batch))).unwrap(),
+                        }
+                    }
+                }
+            });
+        } else {
+            if let Err(e) = self.sender.send(None) {
+                return Err(box_err!("broken channel: {:?}", e));
+            }
+        }
+        Ok(())
     }
 }
