@@ -142,7 +142,6 @@ impl LogItemBatchFileReader {
 type LogItemBatchReceiver = Receiver<Option<Result<LogItemBatch>>>;
 
 pub struct LogItemBatchConcurrentFilesReader {
-    // concurrency: usize,
     mem_limits: usize,
     read_block_size: usize,
 
@@ -161,7 +160,6 @@ impl LogItemBatchConcurrentFilesReader {
     ) -> Result<Self> {
         let (tx, rs) = unbounded();
         let mut reader = Self {
-            // concurrency,
             mem_limits: mem_limits.0 as usize,
             read_block_size: read_block_size.0 as usize,
 
@@ -171,45 +169,52 @@ impl LogItemBatchConcurrentFilesReader {
             current: None,
         };
         for _ in 0..concurrency {
-            reader.spawn()?;
+            reader.spawn();
         }
         Ok(reader)
     }
 
-    pub fn next(&mut self) -> Result<Option<LogItemBatch>> {
+    pub fn next(&mut self) -> Option<Result<LogItemBatch>> {
         if let Some(ref mut current) = self.current {
-            todo!()
-        } else {
-            todo!()
+            match current.recv().unwrap() {
+                Some(r) => return Some(r),
+                None => self.current = None,
+            }
         }
+        assert!(self.current.is_none());
+        self.current = self.receiver.recv().unwrap();
+        if self.current.is_none() {
+            return None;
+        }
+        self.next()
     }
 
-    fn spawn(&mut self) -> Result<()> {
-        if let Some(file) = self.files.lock().pop_front() {
-            let mut reader = LogItemBatchFileReader::new(self.read_block_size);
-            let (tx, rx) = unbounded();
-            if let Err(e) = self.sender.send(Some(rx)) {
-                return Err(box_err!("broken channel: {:?}", e));
-            }
-            std::thread::spawn(move || match reader.open(file.0, file.1) {
-                Err(e) => tx.send(Some(Err(e))).unwrap(),
-                Ok(iter) => {
-                    for r in iter {
-                        match r {
-                            Err(e) => {
-                                tx.send(Some(Err(e))).unwrap();
-                                break;
-                            }
-                            Ok(batch) => tx.send(Some(Ok(batch))).unwrap(),
-                        }
+    fn spawn(&mut self) {
+        let files = Arc::clone(&self.files);
+        let read_block_size = self.read_block_size;
+        let sender = self.sender.clone();
+        std::thread::spawn(move || loop {
+            // NOTE: `guard` must NOT be drop before the new `LogItemBatchReceiver` is sent.
+            let mut guard = files.lock();
+            if let Some(file) = guard.pop_front() {
+                let mut reader = LogItemBatchFileReader::new(read_block_size);
+                let (tx, rx) = unbounded();
+                sender.send(Some(rx)).unwrap();
+                drop(guard);
+                let iter = match reader.open(file.0, file.1) {
+                    Ok(iter) => iter,
+                    Err(e) => {
+                        tx.send(Some(Err(e))).unwrap();
+                        break;
                     }
+                };
+                for r in iter {
+                    tx.send(Some(r)).unwrap();
                 }
-            });
-        } else {
-            if let Err(e) = self.sender.send(None) {
-                return Err(box_err!("broken channel: {:?}", e));
+                tx.send(None).unwrap();
+            } else {
+                sender.send(None).unwrap();
             }
-        }
-        Ok(())
+        });
     }
 }
