@@ -261,22 +261,34 @@ where
         };
 
         let start = Instant::now();
-        let memtables = Self::parallel_recover(
-            recover_append_threads,
-            cfg.recovery_read_block_size.0 as usize,
-            cfg.recovery_mode,
-            LogQueue::Append,
-            append_readables_with_ids,
-            global_stats.clone(),
-        )?;
-        let rewrite_memtables = Self::parallel_recover(
-            recover_rewrite_threads,
-            cfg.recovery_read_block_size.0 as usize,
-            cfg.recovery_mode,
-            LogQueue::Rewrite,
-            rewrite_readables_with_ids,
-            global_stats.clone(),
-        )?;
+
+        let mut memtable_accessors: VecDeque<Result<MemTableAccessor>> = [
+            (
+                LogQueue::Append,
+                recover_append_threads,
+                Some(append_readables_with_ids),
+            ),
+            (
+                LogQueue::Rewrite,
+                recover_rewrite_threads,
+                Some(rewrite_readables_with_ids),
+            ),
+        ]
+        .par_iter_mut()
+        .map(|(queue, concurrency, recover_contexts)| {
+            Self::parallel_recover(
+                *concurrency,
+                cfg.recovery_read_block_size.0 as usize,
+                cfg.recovery_mode,
+                *queue,
+                recover_contexts.take().unwrap(),
+                global_stats.clone(),
+            )
+        })
+        .collect();
+        assert_eq!(memtable_accessors.len(), 2);
+        let memtables = memtable_accessors.pop_front().unwrap()?;
+        let rewrite_memtables = memtable_accessors.pop_front().unwrap()?;
         info!("Recovering raft logs takes {:?}", start.elapsed());
 
         let ids = memtables.cleaned_region_ids();
