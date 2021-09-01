@@ -54,7 +54,7 @@ pub struct MemTable {
     region_id: u64,
 
     // Entries are pushed back with continuously ascending indexes.
-    entries_index: VecDeque<EntryIndex>,
+    entries_index: Vec<EntryIndex>,
     // The amount of rewritten entries. This can be used to index appended entries
     // because rewritten entries are always at front.
     rewrite_count: usize,
@@ -69,7 +69,7 @@ impl MemTable {
     pub fn new(region_id: u64, global_stats: Arc<GlobalStats>) -> MemTable {
         MemTable {
             region_id,
-            entries_index: VecDeque::with_capacity(SHRINK_CACHE_CAPACITY),
+            entries_index: Vec::with_capacity(SHRINK_CACHE_CAPACITY),
             rewrite_count: 0,
             kvs: HashMap::default(),
 
@@ -82,8 +82,8 @@ impl MemTable {
             return None;
         }
 
-        let first_index = self.entries_index.front().unwrap().index;
-        let last_index = self.entries_index.back().unwrap().index;
+        let first_index = self.entries_index.first().unwrap().index;
+        let last_index = self.entries_index.last().unwrap().index;
         if index < first_index || index > last_index {
             return None;
         }
@@ -105,14 +105,14 @@ impl MemTable {
         }
     }
 
-    pub fn append(&mut self, entries_index: Vec<EntryIndex>) {
+    pub fn append(&mut self, mut entries_index: Vec<EntryIndex>) {
         if entries_index.is_empty() {
             return;
         }
         let first_index_to_add = entries_index[0].index;
         self.cut_entries_index(first_index_to_add);
 
-        if let Some(index) = self.entries_index.back() {
+        if let Some(index) = self.entries_index.last() {
             assert_eq!(
                 index.index + 1,
                 first_index_to_add,
@@ -121,14 +121,14 @@ impl MemTable {
             );
         }
 
-        self.entries_index.extend(entries_index);
+        self.entries_index.append(&mut entries_index);
     }
 
     // This will only be called during recovery.
     pub fn append_rewrite(&mut self, entries_index: Vec<EntryIndex>) {
         self.global_stats.add_rewrite(entries_index.len());
         match (
-            self.entries_index.back().map(|x| x.index),
+            self.entries_index.last().map(|x| x.index),
             entries_index.first(),
         ) {
             (Some(back_idx), Some(first)) if back_idx + 1 < first.index => {
@@ -248,11 +248,11 @@ impl MemTable {
     }
 
     pub fn compact_to(&mut self, mut idx: u64) -> u64 {
-        let first_idx = match self.entries_index.front() {
+        let first_idx = match self.entries_index.first() {
             Some(e) if e.index < idx => e.index,
             _ => return 0,
         };
-        let last_idx = self.entries_index.back().unwrap().index;
+        let last_idx = self.entries_index.last().unwrap().index;
         idx = cmp::min(last_idx + 1, idx);
 
         let drain_end = (idx - first_idx) as usize;
@@ -271,8 +271,8 @@ impl MemTable {
         if self.entries_index.is_empty() {
             return 0;
         }
-        let last_index = self.entries_index.back().unwrap().index;
-        let first_index = self.entries_index.front().unwrap().index;
+        let last_index = self.entries_index.last().unwrap().index;
+        let first_index = self.entries_index.first().unwrap().index;
         // Compacted entries can't be overwritten.
         assert!(first_index <= index, "corrupted raft {}", self.region_id);
 
@@ -304,7 +304,7 @@ impl MemTable {
     /// Only called during parllel recovery.
     pub fn merge(&mut self, rhs: &mut Self) {
         assert_eq!(self.region_id, rhs.region_id);
-        if let (Some(last), Some(next)) = (self.entries_index.back(), rhs.entries_index.front()) {
+        if let (Some(last), Some(next)) = (self.entries_index.last(), rhs.entries_index.first()) {
             assert_eq!(last.index + 1, next.index);
         }
         self.entries_index.append(&mut rhs.entries_index);
@@ -321,8 +321,8 @@ impl MemTable {
         if !self.entries_index.is_empty() {
             if !rhs.entries_index.is_empty() {
                 let front = self.entries_index[0].index;
-                let self_back = rhs.entries_index.back().unwrap().index;
-                let self_front = rhs.entries_index.front().unwrap().index;
+                let self_back = rhs.entries_index.last().unwrap().index;
+                let self_front = rhs.entries_index.first().unwrap().index;
                 if front > self_back + 1 {
                     rhs.compact_to(self_back + 1);
                 } else if front >= self_front {
@@ -333,7 +333,7 @@ impl MemTable {
             }
             rhs.entries_index.reserve(self.entries_index.len());
             for ei in std::mem::take(&mut self.entries_index) {
-                rhs.entries_index.push_back(ei);
+                rhs.entries_index.push(ei);
             }
         }
 
@@ -356,11 +356,11 @@ impl MemTable {
         if self.entries_index.is_empty() {
             return Err(Error::StorageUnavailable);
         }
-        let first_index = self.entries_index.front().unwrap().index;
+        let first_index = self.entries_index.first().unwrap().index;
         if begin < first_index {
             return Err(Error::StorageCompacted);
         }
-        let last_index = self.entries_index.back().unwrap().index;
+        let last_index = self.entries_index.last().unwrap().index;
         if end > last_index + 1 {
             return Err(Error::StorageUnavailable);
         }
@@ -368,10 +368,10 @@ impl MemTable {
         let start_pos = (begin - first_index) as usize;
         let end_pos = (end - begin) as usize + start_pos;
 
-        let (first, second) = slices_in_range(&self.entries_index, start_pos, end_pos);
+        let slice = &self.entries_index[start_pos..end_pos];
         if let Some(max_size) = max_size {
             let mut total_size = 0;
-            for idx in first.iter().chain(second) {
+            for idx in slice.iter() {
                 total_size += idx.entry_len;
                 // No matter max_size's value, fetch one entry at least.
                 if total_size as usize > max_size && total_size > idx.entry_len {
@@ -380,9 +380,23 @@ impl MemTable {
                 vec_idx.push(idx.clone());
             }
         } else {
-            vec_idx.extend_from_slice(first);
-            vec_idx.extend_from_slice(second);
+            vec_idx.extend_from_slice(slice);
         }
+        // let (first, second) = slices_in_range(&self.entries_index, start_pos, end_pos);
+        // if let Some(max_size) = max_size {
+        //     let mut total_size = 0;
+        //     for idx in first.iter().chain(second) {
+        //         total_size += idx.entry_len;
+        //         // No matter max_size's value, fetch one entry at least.
+        //         if total_size as usize > max_size && total_size > idx.entry_len {
+        //             break;
+        //         }
+        //         vec_idx.push(idx.clone());
+        //     }
+        // } else {
+        //     vec_idx.extend_from_slice(first);
+        //     vec_idx.extend_from_slice(second);
+        // }
         Ok(())
     }
 
@@ -411,7 +425,7 @@ impl MemTable {
     pub fn fetch_rewritten_entry_indexes(&self, vec_idx: &mut Vec<EntryIndex>) -> Result<()> {
         if self.rewrite_count > 0 {
             let end = self.entries_index[self.rewrite_count - 1].index + 1;
-            let first = self.entries_index.front().unwrap().index;
+            let first = self.entries_index.first().unwrap().index;
             return self.fetch_entries_to(first, end, None, vec_idx);
         }
         Ok(())
@@ -437,7 +451,7 @@ impl MemTable {
         let entry = match queue {
             LogQueue::Append => self.entries_index.get(self.rewrite_count),
             LogQueue::Rewrite if self.rewrite_count == 0 => None,
-            LogQueue::Rewrite => self.entries_index.front(),
+            LogQueue::Rewrite => self.entries_index.first(),
         };
         let ents_min = entry.map(|e| e.file_id);
         let kvs_min = self
@@ -468,11 +482,11 @@ impl MemTable {
     }
 
     pub fn first_index(&self) -> Option<u64> {
-        self.entries_index.front().map(|e| e.index)
+        self.entries_index.first().map(|e| e.index)
     }
 
     pub fn last_index(&self) -> Option<u64> {
-        self.entries_index.back().map(|e| e.index)
+        self.entries_index.last().map(|e| e.index)
     }
 }
 
@@ -495,7 +509,7 @@ mod tests {
         pub fn max_file_id(&self, queue: LogQueue) -> Option<FileId> {
             let entry = match queue {
                 LogQueue::Append if self.rewrite_count == self.entries_index.len() => None,
-                LogQueue::Append => self.entries_index.back(),
+                LogQueue::Append => self.entries_index.last(),
                 LogQueue::Rewrite if self.rewrite_count == 0 => None,
                 LogQueue::Rewrite => self.entries_index.get(self.rewrite_count - 1),
             };
@@ -528,8 +542,8 @@ mod tests {
                 return;
             }
 
-            let begin = self.entries_index.front().unwrap().index;
-            let end = self.entries_index.back().unwrap().index + 1;
+            let begin = self.entries_index.first().unwrap().index;
+            let end = self.entries_index.last().unwrap().index + 1;
             self.fetch_entries_to(begin, end, None, vec_idx).unwrap();
         }
 
@@ -544,8 +558,8 @@ mod tests {
                 return;
             }
 
-            let ei_first = self.entries_index.front().unwrap();
-            let ei_last = self.entries_index.back().unwrap();
+            let ei_first = self.entries_index.first().unwrap();
+            let ei_last = self.entries_index.last().unwrap();
             assert_eq!(
                 ei_last.index - ei_first.index + 1,
                 self.entries_index.len() as u64
@@ -896,7 +910,7 @@ mod tests {
         let ents_idx = generate_entry_indexes(35, 36, LogQueue::Append, 5.into());
         memtable.append(ents_idx);
         memtable.put(b"kk3".to_vec(), b"vv33".to_vec(), 5.into());
-        assert_eq!(memtable.entries_index.back().unwrap().index, 35);
+        assert_eq!(memtable.entries_index.last().unwrap().index, 35);
 
         // Rewrite valid + overwritten entries.
         let ents_idx = generate_entry_indexes(30, 40, LogQueue::Rewrite, 102.into());
@@ -916,7 +930,7 @@ mod tests {
         let ents_idx = generate_entry_indexes(35, 50, LogQueue::Append, 6.into());
         memtable.append(ents_idx);
         memtable.compact_to(30);
-        assert_eq!(memtable.entries_index.back().unwrap().index, 49);
+        assert_eq!(memtable.entries_index.last().unwrap().index, 49);
         assert_eq!(memtable.rewrite_count, 5);
         assert_eq!(memtable.global_stats.rewrite_operations(), 55);
         assert_eq!(memtable.global_stats.compacted_rewrite_operations(), 47);
