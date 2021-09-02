@@ -1,5 +1,6 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
+use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::{cmp, u64};
@@ -11,6 +12,7 @@ use crate::{Error, GlobalStats, Result};
 
 const SHRINK_CACHE_CAPACITY: usize = 64;
 const SHRINK_CACHE_LIMIT: usize = 512;
+const TOMBSTONE_KEY: &[u8; 32] = b"7925C18B80DD2C3AED4428FDC750D730";
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct EntryIndex {
@@ -62,6 +64,9 @@ pub struct MemTable {
     // key -> (value, queue, file_id)
     kvs: HashMap<Vec<u8>, (Vec<u8>, LogQueue, FileId)>,
 
+    // For recovery only.
+    compacted: u64,
+
     global_stats: Arc<GlobalStats>,
 }
 
@@ -72,6 +77,8 @@ impl MemTable {
             entries_index: VecDeque::with_capacity(SHRINK_CACHE_CAPACITY),
             rewrite_count: 0,
             kvs: HashMap::default(),
+
+            compacted: 0,
 
             global_stats,
         }
@@ -460,6 +467,127 @@ impl MemTable {
 
     pub fn last_index(&self) -> Option<u64> {
         self.entries_index.back().map(|e| e.index)
+    }
+
+    // ingest funcitons (for parallel recovery)
+
+    /// Check if the `MemTable` is valid after ingestions, and clear temporary states.
+    pub fn validate(&mut self) -> Result<()> {
+        if let Some(front_ei) = self.entries_index.front() {
+            assert!(front_ei.index >= self.compacted);
+        }
+        let invalid_file_id = FileId::default();
+        for ei in &self.entries_index {
+            if ei.file_id == invalid_file_id {
+                return Err(Error::Corruption(format!(
+                    "memtable[{}] log corrupted at {}",
+                    self.region_id, ei.index
+                )));
+            }
+        }
+        self.kvs.retain(|_, (v, _, _)| v != TOMBSTONE_KEY);
+        Ok(())
+    }
+
+    // TODO(MrCroxx): unit test.
+    /// Ingest a continuous slice of `EntryIndex` into `MemTable`.
+    pub fn ingest_entries_index(&mut self, mut entries_index: Vec<EntryIndex>) {
+        if entries_index.is_empty() {
+            return;
+        }
+        if self.entries_index.is_empty() {
+            self.entries_index.extend(entries_index.drain(..));
+            return;
+        }
+        // front [ memtable ] back
+        let front = self.entries_index.front().unwrap().index;
+        let back = self.entries_index.back().unwrap().index;
+        // first [ ingest ] last
+        let first = entries_index.first().unwrap().index;
+        let last = entries_index.last().unwrap().index;
+
+        // ranges can be devided into the following parts:
+        // | left | left gap | memtable (intersect or not) | right gap | right |
+        // invariant: index > 0
+
+        let mut i = front - 1;
+        while i >= first && i >= self.compacted {
+            if i <= last {
+                // left
+                self.entries_index
+                    .push_front(entries_index[(i - first) as usize].clone());
+            } else {
+                // left gap
+                self.entries_index.push_front(EntryIndex {
+                    index: i,
+                    ..Default::default()
+                })
+            }
+            i -= 1;
+        }
+        let mut i = back + 1;
+        while i <= last && i >= self.compacted {
+            if i >= first {
+                // right
+                self.entries_index
+                    .push_back(entries_index[(i - first) as usize].clone());
+            } else {
+                // right gap
+                self.entries_index.push_back(EntryIndex {
+                    index: i,
+                    ..Default::default()
+                })
+            }
+            i += 1;
+        }
+        let mut i = front;
+        while i <= back && i >= self.compacted {
+            if i >= first && i <= last {
+                // intersect
+                let entry_index = &mut self.entries_index[(i - front) as usize];
+                let ei = &mut entries_index[(i - first) as usize];
+                // Use `<=` rather than `<`, it is supposed to replace the existing `EntryIndex`
+                // with the new one for a single log file is always read sequentially.
+                if entry_index.file_id <= ei.file_id {
+                    *entry_index = ei.clone();
+                }
+            } else {
+                // not intersect
+            }
+            i += 1;
+        }
+    }
+
+    pub fn ingest_put(&mut self, key: Vec<u8>, value: Vec<u8>, queue: LogQueue, file_id: FileId) {
+        if let Some(v) = self.kvs.get_mut(&key) {
+            if v.2 <= file_id {
+                *v = (value, queue, file_id);
+            }
+        } else {
+            self.kvs.insert(key, (value, queue, file_id));
+        }
+    }
+
+    pub fn ingest_delete(&mut self, key: Vec<u8>, queue: LogQueue, file_id: FileId) {
+        if let Some(v) = self.kvs.get_mut(&key) {
+            if v.2 <= file_id {
+                *v = (TOMBSTONE_KEY.to_vec(), queue, file_id);
+            }
+        } else {
+            self.kvs
+                .insert(key, (TOMBSTONE_KEY.to_vec(), queue, file_id));
+        }
+    }
+
+    // TODO(MrCroxx): unit test.
+    pub fn ingest_compact_to(&mut self, idx: u64) {
+        let front = match self.entries_index.front() {
+            Some(e) if e.index < idx => e.index,
+            _ => return,
+        };
+        let compact = std::cmp::min((idx - front) as usize, self.entries_index.len());
+        self.entries_index.drain(..compact);
+        self.compacted = idx;
     }
 }
 
