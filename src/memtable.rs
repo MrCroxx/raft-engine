@@ -555,10 +555,6 @@ impl MemTable {
         while i <= back && i >= self.compacted {
             if i >= first && i <= last {
                 // intersect
-                println!(
-                    "front:{} back:{} | first:{} last:{} | i:{}",
-                    front, back, first, last, i
-                );
                 let entry_index = &mut self.entries_index[(i - front) as usize];
                 let ei = &mut entries_index[(i - first) as usize];
                 // Use `<=` rather than `<`, it is supposed to replace the existing `EntryIndex`
