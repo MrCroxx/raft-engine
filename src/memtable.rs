@@ -5,6 +5,8 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::{cmp, u64};
 
+use log::{error, info, warn};
+
 use crate::log_batch::CompressionType;
 use crate::pipe_log::{FileId, LogQueue};
 use crate::util::{slices_in_range, HashMap};
@@ -469,29 +471,39 @@ impl MemTable {
         self.entries_index.back().map(|e| e.index)
     }
 
-    // ingest funcitons (for parallel recovery)
+    // for unordered recovery
 
     /// Check if the `MemTable` is valid after ingestions, and clear temporary states.
-    pub fn validate(&mut self) -> Result<()> {
+    pub fn validate(&mut self, queue: LogQueue) -> Result<()> {
         if let Some(front_ei) = self.entries_index.front() {
             assert!(front_ei.index >= self.compacted);
         }
         let invalid_file_id = FileId::default();
-        for ei in &self.entries_index {
-            if ei.file_id == invalid_file_id {
-                return Err(Error::Corruption(format!(
-                    "memtable[{}] log corrupted at {}",
-                    self.region_id, ei.index
-                )));
+        let region_id = self.region_id;
+
+        let len_before_retain = self.entries_index.len();
+        self.entries_index.retain(|ei| {
+            let valid = ei.file_id != invalid_file_id;
+            if queue == LogQueue::Append && !valid {
+                error!(
+                    "append log corrupted at region:{} index:{}",
+                    region_id, ei.index
+                );
             }
+            valid
+        });
+        if queue == LogQueue::Append && self.entries_index.len() != len_before_retain {
+            return Err(Error::Corruption(
+                "append queue log corrupted, check error log for missing entries".to_owned(),
+            ));
         }
         self.kvs.retain(|_, (v, _, _)| v != TOMBSTONE_KEY);
         Ok(())
     }
 
-    // TODO(MrCroxx): unit test.
+    // TODO(MrCroxx): unordered_append_rewrite & unit test.
     /// Ingest a continuous slice of `EntryIndex` into `MemTable`.
-    pub fn ingest_entries_index(&mut self, mut entries_index: Vec<EntryIndex>) {
+    pub fn unordered_append(&mut self, mut entries_index: Vec<EntryIndex>) {
         if entries_index.is_empty() {
             return;
         }
@@ -544,6 +556,10 @@ impl MemTable {
         while i <= back && i >= self.compacted {
             if i >= first && i <= last {
                 // intersect
+                println!(
+                    "front:{} back:{} | first:{} last:{} | i:{}",
+                    front, back, first, last, i
+                );
                 let entry_index = &mut self.entries_index[(i - front) as usize];
                 let ei = &mut entries_index[(i - first) as usize];
                 // Use `<=` rather than `<`, it is supposed to replace the existing `EntryIndex`
@@ -558,7 +574,18 @@ impl MemTable {
         }
     }
 
-    pub fn ingest_put(&mut self, key: Vec<u8>, value: Vec<u8>, queue: LogQueue, file_id: FileId) {
+    pub fn unordered_append_rewrite(&mut self, entries_index: Vec<EntryIndex>) {
+        self.rewrite_count += entries_index.len();
+        self.unordered_append(entries_index);
+    }
+
+    pub fn unordered_put(
+        &mut self,
+        key: Vec<u8>,
+        value: Vec<u8>,
+        queue: LogQueue,
+        file_id: FileId,
+    ) {
         if let Some(v) = self.kvs.get_mut(&key) {
             if v.2 <= file_id {
                 *v = (value, queue, file_id);
@@ -568,7 +595,7 @@ impl MemTable {
         }
     }
 
-    pub fn ingest_delete(&mut self, key: Vec<u8>, queue: LogQueue, file_id: FileId) {
+    pub fn unordered_delete(&mut self, key: Vec<u8>, queue: LogQueue, file_id: FileId) {
         if let Some(v) = self.kvs.get_mut(&key) {
             if v.2 <= file_id {
                 *v = (TOMBSTONE_KEY.to_vec(), queue, file_id);
@@ -580,7 +607,7 @@ impl MemTable {
     }
 
     // TODO(MrCroxx): unit test.
-    pub fn ingest_compact_to(&mut self, idx: u64) {
+    pub fn unordered_compact_to(&mut self, idx: u64) {
         let front = match self.entries_index.front() {
             Some(e) if e.index < idx => e.index,
             _ => return,

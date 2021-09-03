@@ -1,26 +1,30 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
 use std::collections::{HashSet, VecDeque};
+use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
 use std::{mem, u64};
 
 use fail::fail_point;
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use parking_lot::{Mutex, RwLock};
 use protobuf::{parse_from_bytes, Message};
 
 use crate::config::Config;
 use crate::event_listener::EventListener;
 use crate::file_pipe_log::FilePipeLog;
-use crate::file_system::FileSystem;
-use crate::log_batch::{Command, LogBatch, LogItemContent, LogItemDrain, MessageExt, OpType};
+use crate::file_system::{FileSystem, Readable};
+use crate::log_batch::{
+    Command, LogBatch, LogItemBatch, LogItemContent, LogItemDrain, MessageExt, OpType,
+};
 use crate::memtable::{EntryIndex, MemTable};
-use crate::metrics::*;
 use crate::pipe_log::{FileId, LogQueue, PipeLog};
 use crate::purge::{PurgeHook, PurgeManager};
+use crate::reader::LogItemBatchFileReader;
 use crate::util::{HashMap, InstantExt};
+use crate::{metrics::*, RecoveryMode};
 use crate::{GlobalStats, Result};
 
 const SLOTS_COUNT: usize = 128;
@@ -36,6 +40,9 @@ pub struct MemTableAccessor {
 
     // Deleted region memtables that are not yet rewritten.
     removed_memtables: Arc<Mutex<VecDeque<u64>>>,
+
+    // All deleted regions, for unordered recovery only.
+    unordered_removed_memtables: Arc<Mutex<HashSet<u64>>>,
 }
 
 impl MemTableAccessor {
@@ -48,6 +55,7 @@ impl MemTableAccessor {
             slots,
             initializer,
             removed_memtables: Default::default(),
+            unordered_removed_memtables: Default::default(),
         }
     }
 
@@ -127,6 +135,44 @@ impl MemTableAccessor {
         }
         ids
     }
+
+    // unordered recovery mothoeds
+
+    /// For unordered recovery only, return None if the
+    pub fn undordered_get_or_insert(&self, raft_group_id: u64) -> Option<Arc<RwLock<MemTable>>> {
+        if self
+            .unordered_removed_memtables
+            .lock()
+            .contains(&raft_group_id)
+        {
+            return None;
+        }
+        Some(self.get_or_insert(raft_group_id))
+    }
+
+    pub fn unordered_remove(&self, raft_group_id: u64, queue: LogQueue) {
+        self.unordered_removed_memtables
+            .lock()
+            .insert(raft_group_id);
+        self.remove(raft_group_id, queue, FileId::default());
+    }
+
+    /// Check if all of the memtables are valid after unordered recovery.
+    pub fn validate(&self, queue: LogQueue) -> Result<()> {
+        self.unordered_removed_memtables.lock().clear();
+        for tables in &self.slots {
+            for memtable in tables.read().values() {
+                memtable.write().validate(queue)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+pub struct RecoverContext {
+    pub file_id: FileId,
+    pub file_size: usize,
+    pub file_reader: Option<Box<dyn Readable>>,
 }
 
 #[derive(Clone)]
@@ -167,28 +213,66 @@ where
         let global_stats = Arc::new(GlobalStats::default());
 
         let global_stats_clone = global_stats.clone();
-        let rewrite_memtables = MemTableAccessor::new(Arc::new(move |id: u64| {
+        let rewrite_memtables = Arc::new(MemTableAccessor::new(Arc::new(move |id: u64| {
             MemTable::new(id, global_stats_clone.clone())
-        }));
+        })));
         let global_stats_clone = global_stats.clone();
-        let memtables = MemTableAccessor::new(Arc::new(move |id: u64| {
+        let memtables = Arc::new(MemTableAccessor::new(Arc::new(move |id: u64| {
             MemTable::new(id, global_stats_clone.clone())
-        }));
+        })));
+
+        let (pipe_log, append_recover_contexts, rewrite_recover_contexts) =
+            FilePipeLog::open(&cfg, file_system, listeners.clone())?;
 
         let start = Instant::now();
-        let pipe_log = FilePipeLog::open(
-            &cfg,
-            file_system,
-            listeners.clone(),
-            |queue, file_id, mut item_batch| match queue {
-                LogQueue::Rewrite => {
-                    Self::apply_to_memtable(&rewrite_memtables, item_batch.drain(), queue, file_id)
-                }
-                LogQueue::Append => {
-                    Self::apply_to_memtable(&memtables, item_batch.drain(), queue, file_id)
-                }
-            },
+        let recover_append_threads = match append_recover_contexts.is_empty() {
+            true => 0,
+            false => std::cmp::max(
+                cfg.recovery_threads - 1,
+                std::cmp::min(
+                    1,
+                    append_recover_contexts.len()
+                        / (append_recover_contexts.len() + rewrite_recover_contexts.len()),
+                ),
+            ),
+        };
+        let recover_rewrite_threads = match rewrite_recover_contexts.is_empty() {
+            true => 0,
+            false => cfg.recovery_threads - recover_append_threads,
+        };
+
+        let mut handles = Self::parallel_recover_memtables(
+            cfg.recovery_read_block_size.0 as usize,
+            recover_append_threads,
+            cfg.recovery_mode,
+            memtables.clone(),
+            append_recover_contexts,
+            LogQueue::Append,
         )?;
+        handles.append(&mut Self::parallel_recover_memtables(
+            cfg.recovery_read_block_size.0 as usize,
+            recover_rewrite_threads,
+            cfg.recovery_mode,
+            rewrite_memtables.clone(),
+            rewrite_recover_contexts,
+            LogQueue::Rewrite,
+        )?);
+
+        for handle in handles {
+            handle.join().unwrap()?;
+        }
+
+        let memtables = match Arc::try_unwrap(memtables) {
+            Ok(m) => m,
+            Err(_) => return Err(box_err!("unable to deref Arc<MemTableAccessor>")),
+        };
+        let rewrite_memtables = match Arc::try_unwrap(rewrite_memtables) {
+            Ok(m) => m,
+            Err(_) => return Err(box_err!("unable to deref Arc<MemTableAccessor>")),
+        };
+        memtables.validate(LogQueue::Append)?;
+        rewrite_memtables.validate(LogQueue::Rewrite)?;
+
         info!("Recovering raft logs takes {:?}", start.elapsed());
 
         let ids = memtables.cleaned_region_ids();
@@ -222,6 +306,128 @@ where
             listeners,
             _phantom: PhantomData,
         })
+    }
+
+    fn parallel_recover_memtables(
+        concurrency: usize,
+        read_block_size: usize,
+        recovery_mode: RecoveryMode,
+        memtables: Arc<MemTableAccessor>,
+        mut recover_contexts: Vec<RecoverContext>,
+        queue: LogQueue,
+    ) -> Result<Vec<std::thread::JoinHandle<Result<()>>>> {
+        if recover_contexts.is_empty() {
+            return Ok(vec![]);
+        }
+        let files_per_thread = std::cmp::max(1, recover_contexts.len() / concurrency);
+
+        let mut handles = Vec::with_capacity(concurrency);
+        let mut chunks: Vec<Vec<RecoverContext>> = Vec::with_capacity(concurrency);
+        while !recover_contexts.is_empty() {
+            chunks.push(recover_contexts.drain(..files_per_thread).collect());
+        }
+        let chunk_count = chunks.len();
+        for (i, chunk) in chunks.drain(..).enumerate() {
+            let memtables_clone = memtables.clone();
+            handles.push(std::thread::Builder::new().spawn(move || {
+                Self::recover_memtables(
+                    read_block_size,
+                    memtables_clone,
+                    chunk,
+                    recovery_mode == RecoveryMode::TolerateCorruptedTailRecords
+                        && i == chunk_count - 1,
+                    queue,
+                )
+            })?);
+        }
+        Ok(handles)
+    }
+
+    fn recover_memtables(
+        read_block_size: usize,
+        memtables: Arc<MemTableAccessor>,
+        mut recover_contexts: Vec<RecoverContext>,
+        tolerate_tail_failure: bool,
+        queue: LogQueue,
+    ) -> Result<()> {
+        let mut reader = LogItemBatchFileReader::new(read_block_size);
+        let file_count = recover_contexts.len();
+        for (i, recover_context) in recover_contexts.iter_mut().enumerate() {
+            reader.open(
+                recover_context.file_reader.take().unwrap(),
+                recover_context.file_size,
+            )?;
+            loop {
+                match reader.next() {
+                    Ok(Some(mut item_batch)) => {
+                        item_batch.set_position(queue, recover_context.file_id, None);
+
+                        for item in item_batch.drain() {
+                            match item.content {
+                                LogItemContent::EntriesIndex(entries_index) => {
+                                    if let Some(memtable) =
+                                        memtables.undordered_get_or_insert(item.raft_group_id)
+                                    {
+                                        match queue {
+                                            LogQueue::Append => {
+                                                memtable.write().unordered_append(entries_index.0)
+                                            }
+                                            LogQueue::Rewrite => memtable
+                                                .write()
+                                                .unordered_append_rewrite(entries_index.0),
+                                        }
+                                    }
+                                }
+                                LogItemContent::Command(cmd) => match cmd {
+                                    Command::Clean => {
+                                        memtables.unordered_remove(item.raft_group_id, queue)
+                                    }
+                                    Command::Compact { index } => {
+                                        if let Some(memtable) =
+                                            memtables.undordered_get_or_insert(item.raft_group_id)
+                                        {
+                                            memtable.write().unordered_compact_to(index)
+                                        }
+                                    }
+                                },
+                                LogItemContent::Kv(kv) => match kv.op_type {
+                                    OpType::Put => {
+                                        if let Some(memtable) =
+                                            memtables.undordered_get_or_insert(item.raft_group_id)
+                                        {
+                                            memtable.write().unordered_put(
+                                                kv.key,
+                                                kv.value.unwrap(),
+                                                queue,
+                                                recover_context.file_id,
+                                            )
+                                        }
+                                    }
+                                    OpType::Del => {
+                                        if let Some(memtable) =
+                                            memtables.undordered_get_or_insert(item.raft_group_id)
+                                        {
+                                            memtable.write().unordered_delete(
+                                                kv.key,
+                                                queue,
+                                                recover_context.file_id,
+                                            )
+                                        }
+                                    }
+                                },
+                            }
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) if tolerate_tail_failure && i == file_count - 1 => {
+                        warn!("Raft log content is corrupted: {}", e);
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
