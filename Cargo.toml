@@ -53,6 +53,9 @@ protobuf-codegen = { git = "https://github.com/pingcap/rust-protobuf", rev = "82
 [workspace]
 members = [ "stress" ]
 
+[profile.release]
+debug = true
+
 [[bench]]
 name = "bench_recovery"
 harness = false
