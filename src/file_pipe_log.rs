@@ -10,16 +10,15 @@ use std::time::Instant;
 use log::{info, warn};
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::config::{Config, RecoveryMode};
+use crate::config::Config;
 use crate::engine::RecoverContext;
 use crate::event_listener::EventListener;
 use crate::file_system::{FileSystem, Readable, Writable};
-use crate::log_batch::{LogBatch, LogItemBatch};
+use crate::log_batch::LogBatch;
 use crate::log_file::{LogFd, LogFile, LogFileHeader, LOG_FILE_MIN_HEADER_LEN};
+use crate::metrics::*;
 use crate::pipe_log::{FileId, LogQueue, PipeLog};
-use crate::reader::LogItemBatchFileReader;
 use crate::util::InstantExt;
-use crate::{metrics::*, GlobalStats};
 use crate::{Error, Result};
 
 const LOG_SUFFIX: &str = ".raftlog";

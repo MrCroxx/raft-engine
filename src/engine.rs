@@ -1,7 +1,6 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
 use std::collections::{HashSet, VecDeque};
-use std::convert::TryInto;
 use std::marker::PhantomData;
 use std::sync::Arc;
 use std::time::Instant;
@@ -16,9 +15,7 @@ use crate::config::Config;
 use crate::event_listener::EventListener;
 use crate::file_pipe_log::FilePipeLog;
 use crate::file_system::{FileSystem, Readable};
-use crate::log_batch::{
-    Command, LogBatch, LogItemBatch, LogItemContent, LogItemDrain, MessageExt, OpType,
-};
+use crate::log_batch::{Command, LogBatch, LogItemContent, LogItemDrain, MessageExt, OpType};
 use crate::memtable::{EntryIndex, MemTable};
 use crate::pipe_log::{FileId, LogQueue, PipeLog};
 use crate::purge::{PurgeHook, PurgeManager};

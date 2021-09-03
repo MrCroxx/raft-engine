@@ -1,11 +1,10 @@
 // Copyright (c) 2017-present, PingCAP, Inc. Licensed under Apache-2.0.
 
-use std::collections::hash_map::Entry::{Occupied, Vacant};
 use std::collections::VecDeque;
 use std::sync::Arc;
 use std::{cmp, u64};
 
-use log::{error, info, warn};
+use log::error;
 
 use crate::log_batch::CompressionType;
 use crate::pipe_log::{FileId, LogQueue};
