@@ -310,118 +310,144 @@ where
         read_block_size: usize,
         recovery_mode: RecoveryMode,
         memtables: Arc<MemTableAccessor>,
-        mut recover_contexts: Vec<RecoverContext>,
+        recover_contexts: Vec<RecoverContext>,
         queue: LogQueue,
     ) -> Result<Vec<std::thread::JoinHandle<Result<()>>>> {
         if recover_contexts.is_empty() {
             return Ok(vec![]);
         }
-        let files_per_thread = std::cmp::max(1, recover_contexts.len() / concurrency);
 
+        let recover_contexts = Arc::new(Mutex::new(VecDeque::from(recover_contexts)));
         let mut handles = Vec::with_capacity(concurrency);
-        let mut chunks: Vec<Vec<RecoverContext>> = Vec::with_capacity(concurrency);
-        while !recover_contexts.is_empty() {
-            chunks.push(recover_contexts.drain(..files_per_thread).collect());
-        }
-        let chunk_count = chunks.len();
-        for (i, chunk) in chunks.drain(..).enumerate() {
-            let memtables_clone = memtables.clone();
-            handles.push(std::thread::Builder::new().spawn(move || {
-                Self::recover_memtables(
-                    read_block_size,
-                    memtables_clone,
-                    chunk,
-                    recovery_mode == RecoveryMode::TolerateCorruptedTailRecords
-                        && i == chunk_count - 1,
-                    queue,
-                )
-            })?);
+        for _ in 0..concurrency {
+            let rcs = recover_contexts.clone();
+            let ms = memtables.clone();
+            let handle = std::thread::Builder::new().spawn(move || {
+                loop {
+                    let mut guard = rcs.lock();
+                    let rc = match guard.pop_front() {
+                        Some(rc) => rc,
+                        None => break,
+                    };
+                    let last = guard.is_empty();
+                    drop(guard);
+                    Self::recover_memtables(
+                        read_block_size,
+                        ms.clone(),
+                        rc,
+                        recovery_mode == RecoveryMode::TolerateCorruptedTailRecords && last,
+                        queue,
+                    )?;
+                }
+                Ok(())
+            })?;
+            handles.push(handle);
         }
         Ok(handles)
+
+        // let files_per_thread = std::cmp::max(1, recover_contexts.len() / concurrency);
+
+        // let mut handles = Vec::with_capacity(concurrency);
+        // let mut chunks: Vec<Vec<RecoverContext>> = Vec::with_capacity(concurrency);
+        // while !recover_contexts.is_empty() {
+        //     chunks.push(recover_contexts.drain(..files_per_thread).collect());
+        // }
+        // let chunk_count = chunks.len();
+        // for (i, chunk) in chunks.drain(..).enumerate() {
+        //     let memtables_clone = memtables.clone();
+        //     handles.push(std::thread::Builder::new().spawn(move || {
+        //         Self::recover_memtables(
+        //             read_block_size,
+        //             memtables_clone,
+        //             chunk,
+        //             recovery_mode == RecoveryMode::TolerateCorruptedTailRecords
+        //                 && i == chunk_count - 1,
+        //             queue,
+        //         )
+        //     })?);
+        // }
+        // Ok(handles)
     }
 
     fn recover_memtables(
         read_block_size: usize,
         memtables: Arc<MemTableAccessor>,
-        mut recover_contexts: Vec<RecoverContext>,
+        mut recover_context: RecoverContext,
         tolerate_tail_failure: bool,
         queue: LogQueue,
     ) -> Result<()> {
         let mut reader = LogItemBatchFileReader::new(read_block_size);
-        let file_count = recover_contexts.len();
-        for (i, recover_context) in recover_contexts.iter_mut().enumerate() {
-            reader.open(
-                recover_context.file_reader.take().unwrap(),
-                recover_context.file_size,
-            )?;
-            loop {
-                match reader.next() {
-                    Ok(Some(mut item_batch)) => {
-                        item_batch.set_position(queue, recover_context.file_id, None);
+        reader.open(
+            recover_context.file_reader.take().unwrap(),
+            recover_context.file_size,
+        )?;
+        loop {
+            match reader.next() {
+                Ok(Some(mut item_batch)) => {
+                    item_batch.set_position(queue, recover_context.file_id, None);
 
-                        for item in item_batch.drain() {
-                            match item.content {
-                                LogItemContent::EntriesIndex(entries_index) => {
+                    for item in item_batch.drain() {
+                        match item.content {
+                            LogItemContent::EntriesIndex(entries_index) => {
+                                if let Some(memtable) =
+                                    memtables.undordered_get_or_insert(item.raft_group_id)
+                                {
+                                    match queue {
+                                        LogQueue::Append => {
+                                            memtable.write().unordered_append(entries_index.0)
+                                        }
+                                        LogQueue::Rewrite => memtable
+                                            .write()
+                                            .unordered_append_rewrite(entries_index.0),
+                                    }
+                                }
+                            }
+                            LogItemContent::Command(cmd) => match cmd {
+                                Command::Clean => {
+                                    memtables.unordered_remove(item.raft_group_id, queue)
+                                }
+                                Command::Compact { index } => {
                                     if let Some(memtable) =
                                         memtables.undordered_get_or_insert(item.raft_group_id)
                                     {
-                                        match queue {
-                                            LogQueue::Append => {
-                                                memtable.write().unordered_append(entries_index.0)
-                                            }
-                                            LogQueue::Rewrite => memtable
-                                                .write()
-                                                .unordered_append_rewrite(entries_index.0),
-                                        }
+                                        memtable.write().unordered_compact_to(index)
                                     }
                                 }
-                                LogItemContent::Command(cmd) => match cmd {
-                                    Command::Clean => {
-                                        memtables.unordered_remove(item.raft_group_id, queue)
+                            },
+                            LogItemContent::Kv(kv) => match kv.op_type {
+                                OpType::Put => {
+                                    if let Some(memtable) =
+                                        memtables.undordered_get_or_insert(item.raft_group_id)
+                                    {
+                                        memtable.write().unordered_put(
+                                            kv.key,
+                                            kv.value.unwrap(),
+                                            queue,
+                                            recover_context.file_id,
+                                        )
                                     }
-                                    Command::Compact { index } => {
-                                        if let Some(memtable) =
-                                            memtables.undordered_get_or_insert(item.raft_group_id)
-                                        {
-                                            memtable.write().unordered_compact_to(index)
-                                        }
+                                }
+                                OpType::Del => {
+                                    if let Some(memtable) =
+                                        memtables.undordered_get_or_insert(item.raft_group_id)
+                                    {
+                                        memtable.write().unordered_delete(
+                                            kv.key,
+                                            queue,
+                                            recover_context.file_id,
+                                        )
                                     }
-                                },
-                                LogItemContent::Kv(kv) => match kv.op_type {
-                                    OpType::Put => {
-                                        if let Some(memtable) =
-                                            memtables.undordered_get_or_insert(item.raft_group_id)
-                                        {
-                                            memtable.write().unordered_put(
-                                                kv.key,
-                                                kv.value.unwrap(),
-                                                queue,
-                                                recover_context.file_id,
-                                            )
-                                        }
-                                    }
-                                    OpType::Del => {
-                                        if let Some(memtable) =
-                                            memtables.undordered_get_or_insert(item.raft_group_id)
-                                        {
-                                            memtable.write().unordered_delete(
-                                                kv.key,
-                                                queue,
-                                                recover_context.file_id,
-                                            )
-                                        }
-                                    }
-                                },
-                            }
+                                }
+                            },
                         }
                     }
-                    Ok(None) => break,
-                    Err(e) if tolerate_tail_failure && i == file_count - 1 => {
-                        warn!("Raft log content is corrupted: {}", e);
-                        break;
-                    }
-                    Err(e) => return Err(e),
                 }
+                Ok(None) => break,
+                Err(e) if tolerate_tail_failure => {
+                    warn!("Raft log content is corrupted: {}", e);
+                    break;
+                }
+                Err(e) => return Err(e),
             }
         }
         Ok(())
