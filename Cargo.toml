@@ -29,7 +29,6 @@ protobuf = "=2.8.0"
 serde = { version = "1.0", features = ["derive"] }
 thiserror = "1.0"
 
-[dev-dependencies]
 criterion = "0.3.5"
 ctor = "0.1"
 env_logger = "0.7"
@@ -39,6 +38,8 @@ rand = "0.7"
 rand_distr = "0.3"
 tempfile = "3.1"
 toml = "0.5"
+clap = "2.32"
+
 
 [features]
 failpoints = [
@@ -53,7 +54,18 @@ protobuf-codegen = { git = "https://github.com/pingcap/rust-protobuf", rev = "82
 [workspace]
 members = [ "stress" ]
 
+[profile.release]
+debug = true
+
 [[bench]]
 name = "bench_recovery"
 harness = false
 required-features = ["failpoints"]
+
+[[bin]]
+name = "prepare"
+path = "src/vtune/prepare.rs"
+
+[[bin]]
+name = "recovery"
+path = "src/vtune/recovery.rs"
