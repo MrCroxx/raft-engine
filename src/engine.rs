@@ -39,7 +39,7 @@ pub struct MemTableAccessor {
     removed_memtables: Arc<Mutex<VecDeque<u64>>>,
 
     // All deleted regions, for unordered recovery only.
-    unordered_removed_memtables: Arc<Mutex<HashSet<u64>>>,
+    unordered_removed_memtables: Arc<RwLock<HashSet<u64>>>,
 }
 
 impl MemTableAccessor {
@@ -139,7 +139,7 @@ impl MemTableAccessor {
     pub fn undordered_get_or_insert(&self, raft_group_id: u64) -> Option<Arc<RwLock<MemTable>>> {
         if self
             .unordered_removed_memtables
-            .lock()
+            .read()
             .contains(&raft_group_id)
         {
             return None;
@@ -149,14 +149,14 @@ impl MemTableAccessor {
 
     pub fn unordered_remove(&self, raft_group_id: u64, queue: LogQueue) {
         self.unordered_removed_memtables
-            .lock()
+            .write()
             .insert(raft_group_id);
         self.remove(raft_group_id, queue, FileId::default());
     }
 
     /// Check if all of the memtables are valid after unordered recovery.
     pub fn validate(&self, queue: LogQueue) -> Result<()> {
-        self.unordered_removed_memtables.lock().clear();
+        self.unordered_removed_memtables.write().clear();
         for tables in &self.slots {
             for memtable in tables.read().values() {
                 memtable.write().validate(queue)?;
